@@ -507,16 +507,24 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # prompt path borrows are served from RAM (the file source reads none of them).  The device calls are
     # wrapped - conversation_transfer_test's pattern - and `pin = false` keeps the copy pageable, so this
     # runs on a CPU-only PC.
-    if(NOT STRATA_ENABLE_HIP AND UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    if(UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       add_executable(split_lend_complement_test tests/core/split_lend_complement_test.cpp)
       target_link_libraries(split_lend_complement_test PRIVATE strata_engine)
-      target_link_options(split_lend_complement_test PRIVATE
-        -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaFree -Wl,--wrap=cudaMemset -Wl,--wrap=cudaMemcpy
-        -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaDeviceSynchronize
-        -Wl,--wrap=cudaGetLastError -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaSetDevice
-        -Wl,--wrap=cudaMemGetInfo -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost)
+      set(_lend_wrap_functions Malloc Free Memset Memcpy MemcpyAsync StreamSynchronize DeviceSynchronize
+        GetLastError GetDevice SetDevice MemGetInfo)
+      if(STRATA_ENABLE_HIP)
+        set(_lend_wrap_prefix hip)
+        list(APPEND _lend_wrap_functions HostMalloc HostFree FreeHost)
+      else()
+        set(_lend_wrap_prefix cuda)
+        list(APPEND _lend_wrap_functions HostAlloc FreeHost)
+      endif()
+      foreach(_function IN LISTS _lend_wrap_functions)
+        target_link_options(split_lend_complement_test PRIVATE "-Wl,--wrap=${_lend_wrap_prefix}${_function}")
+      endforeach()
       add_test(NAME split_lend_complement_test COMMAND split_lend_complement_test)
-      set_tests_properties(split_lend_complement_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+      set_tests_properties(split_lend_complement_test PROPERTIES
+        ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1" TIMEOUT 120)
     endif()
   endif()
   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)

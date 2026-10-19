@@ -3199,7 +3199,7 @@ bool FileExpertSource::pin_cache_complement(
     if (!stage_lend_regions_.empty()) {
         int64_t offered = 0;
         for (const auto& region : stage_lend_regions_) offered += (int64_t) region.size();
-        std::fprintf(stderr, "FileExpertSource: the split stages lend %lld slots to the prompt path: %lld keep "
+        std::fprintf(stderr, "FileExpertSource: the prefill stages lend %lld slots to the prompt path: %lld keep "
                              "their experts in RAM too (%.2f GiB)%s\n",
                      (long long) offered, (long long) stage_lent, (double) stage_lent_bytes / 1073741824.0,
                      stage_lent < offered ? " (the rest are read from the file when lent: not enough RAM for them)" : "");

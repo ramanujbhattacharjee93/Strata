@@ -6676,9 +6676,20 @@ int main(int argc, char** argv) {
         // arithmetic, and list the pairs from the highest slot down, as the borrowing takes them.  #340 is
         // honoured the same way (the same free-VRAM test, at this startup moment): a part whose card can
         // fund the bound chunk's buffers outright lends nothing at any pick, so it gets no region and no RAM
-        // is spent on it.  The single-GPU loan is untouched: without a split the lend region stays in
-        // pin_cache_complement's own path, and no regions are set.
+        // is spent on it.  A budgeted single-GPU loan uses the same bounded append path: the budget branch in
+        // pin_cache_complement disables its ordinary lend-region plan.
         std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lends;
+        auto add_lend_region = [&](strata::core::ExpertCache& xc, int64_t lb, int64_t le, int64_t first_slot) {
+            std::vector<std::pair<int32_t, int32_t>> region;
+            for (int64_t l = lb; l < le; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (xc.slot_of(l, e) >= first_slot) region.emplace_back((int32_t) l, (int32_t) e);
+            std::sort(region.begin(), region.end(),
+                      [&](const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) {
+                          return xc.slot_of(a.first, a.second) > xc.slot_of(b.first, b.second);
+                      });
+            if (!region.empty()) stage_lends.push_back(std::move(region));
+        };
         decide_split_ring();   // the ring the prompt path really uses, BEFORE bytes_needed sizes the regions below
         if (pf_borrow && d_res != nullptr && o.prefill_chunk > 0 && multi_gpu && !stages.empty()) {
             const int64_t bound = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
@@ -6708,18 +6719,12 @@ int main(int argc, char** argv) {
                 k = std::min(k, xc.slots() - 128);                       // the scan's 128-slot floor
                 if (o.prefill_auto) k = std::min(k, kAutoLendPct * xc.slots() / 100);   // the auto cap
                 if (k <= 0) continue;
-                std::vector<std::pair<int32_t, int32_t>> region;
-                for (int64_t l = lb; l < le; ++l)
-                    for (int64_t e = 0; e < g.n_expert; ++e)
-                        if (xc.slot_of(l, e) >= xc.slots() - k) region.emplace_back((int32_t) l, (int32_t) e);
-                std::sort(region.begin(), region.end(),
-                          [&](const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) {
-                              return xc.slot_of(a.first, a.second) > xc.slot_of(b.first, b.second);
-                          });
-                if (!region.empty()) stage_lends.push_back(std::move(region));
+                add_lend_region(xc, lb, le, xc.slots() - k);
             }
-            src.stage_lend_regions(std::move(stage_lends));
+        } else if (!multi_gpu && o.resident_budget > 0 && lend_from >= 0 && stage_pairs.empty()) {
+            add_lend_region(xcache, 0, g.n_layers, lend_from);
         }
+        if (!stage_lends.empty()) src.stage_lend_regions(std::move(stage_lends));
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);

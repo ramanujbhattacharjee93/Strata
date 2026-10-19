@@ -1,4 +1,4 @@
-// The resident RAM mode with a layer split: the compact copy holds the experts no stage's cache holds AND each
+// The resident RAM mode: the compact copy holds the experts no stage's cache holds AND each
 // stage's LEND REGION - the experts in the cache slots the prompt path borrows - so a prompt streams the
 // borrowed experts from RAM instead of reading the model files through page faults.  Runs on a CPU-only
 // PC: the device calls are wrapped at the link (`--wrap` in CMakeLists.txt, conversation_transfer_test's
@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -22,35 +23,40 @@
 #include <vector>
 
 // ---- the wrapped device calls: memory is ordinary memory and every operation completes at once.
-extern "C" cudaError_t __wrap_cudaMalloc(void** p, size_t n) {
+#define WRAP_GPU_IMPL(name) __wrap_##name
+#define WRAP_GPU(name) WRAP_GPU_IMPL(name)
+using CopyKind = decltype(cudaMemcpyHostToDevice);
+extern "C" cudaError_t WRAP_GPU(cudaMalloc)(void** p, size_t n) {
     *p = std::malloc(n);
     return *p ? cudaSuccess : cudaErrorMemoryAllocation;
 }
-extern "C" cudaError_t __wrap_cudaFree(void* p) { std::free(p); return cudaSuccess; }
-extern "C" cudaError_t __wrap_cudaMemset(void* d, int v, size_t n) { std::memset(d, v, n); return cudaSuccess; }
-extern "C" cudaError_t __wrap_cudaMemcpy(void* d, const void* s, size_t n, cudaMemcpyKind k) {
+extern "C" cudaError_t WRAP_GPU(cudaFree)(void* p) { std::free(p); return cudaSuccess; }
+extern "C" cudaError_t WRAP_GPU(cudaMemset)(void* d, int v, size_t n) { std::memset(d, v, n); return cudaSuccess; }
+extern "C" cudaError_t WRAP_GPU(cudaMemcpy)(void* d, const void* s, size_t n, CopyKind) {
     std::memcpy(d, s, n);
     return cudaSuccess;
 }
-extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* d, const void* s, size_t n, cudaMemcpyKind k, cudaStream_t st) {
+extern "C" cudaError_t WRAP_GPU(cudaMemcpyAsync)(void* d, const void* s, size_t n, CopyKind, cudaStream_t) {
     std::memcpy(d, s, n);
     return cudaSuccess;
 }
-extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t st) { return cudaSuccess; }
-extern "C" cudaError_t __wrap_cudaDeviceSynchronize(void) { return cudaSuccess; }
-extern "C" cudaError_t __wrap_cudaGetLastError(void) { return cudaSuccess; }
-extern "C" cudaError_t __wrap_cudaGetDevice(int* d) { *d = 0; return cudaSuccess; }
-extern "C" cudaError_t __wrap_cudaSetDevice(int d) { return cudaSuccess; }
-extern "C" cudaError_t __wrap_cudaMemGetInfo(size_t* free_b, size_t* total_b) {
+extern "C" cudaError_t WRAP_GPU(cudaStreamSynchronize)(cudaStream_t st) { return cudaSuccess; }
+extern "C" cudaError_t WRAP_GPU(cudaDeviceSynchronize)(void) { return cudaSuccess; }
+extern "C" cudaError_t WRAP_GPU(cudaGetLastError)(void) { return cudaSuccess; }
+extern "C" cudaError_t WRAP_GPU(cudaGetDevice)(int* d) { *d = 0; return cudaSuccess; }
+extern "C" cudaError_t WRAP_GPU(cudaSetDevice)(int d) { return cudaSuccess; }
+extern "C" cudaError_t WRAP_GPU(cudaMemGetInfo)(size_t* free_b, size_t* total_b) {
     *free_b = 64ull << 30;
     *total_b = 128ull << 30;
     return cudaSuccess;
 }
-extern "C" cudaError_t __wrap_cudaHostAlloc(void** p, size_t n, unsigned f) {
+extern "C" cudaError_t WRAP_GPU(cudaHostAlloc)(void** p, size_t n, unsigned f) {
     *p = std::malloc(n);
     return *p ? cudaSuccess : cudaErrorMemoryAllocation;
 }
-extern "C" cudaError_t __wrap_cudaFreeHost(void* p) { std::free(p); return cudaSuccess; }
+extern "C" cudaError_t WRAP_GPU(cudaFreeHost)(void* p) { std::free(p); return cudaSuccess; }
+#undef WRAP_GPU
+#undef WRAP_GPU_IMPL
 
 namespace fs = std::filesystem;
 
@@ -187,6 +193,45 @@ void test_split_lend_region_budget() {
             "the expert past the budget was served by the file source, exactly one blob read");
 }
 
+void test_single_budgeted_lend_regions() {
+    for (const uint64_t budget_blobs : {6, 5, 4, 3}) {
+        Rig rig("single budgeted lend region");
+        std::string err;
+        std::vector<std::pair<int32_t, int32_t>> rank;
+        for (int32_t l = 0; l < kLayers; ++l)
+            for (int32_t e = 0; e < kExperts; ++e) rank.emplace_back(l, e);
+
+        rig.src.stage_lend_regions({{{0, 3}, {0, 2}}});
+        const uint64_t budget = budget_blobs * rig.blob;
+        require(rig.src.pin_cache_complement(rig.stage0, err, false, {}, 2, 0, budget, &rank), err);
+        const uint64_t base_blobs = std::min<uint64_t>(budget_blobs, kExperts);
+        const uint64_t backed = std::min<uint64_t>(2, budget_blobs - base_blobs);
+        require(rig.src.resident_bytes() == budget, "base experts and loan backups did not share one budget");
+        require(rig.src.resident_lent_slots() == (int64_t) backed, "wrong single-GPU loan backup count");
+        for (int64_t e = 0; e < kExperts; ++e) {
+            require(rig.src.has_resident(1, e) == ((uint64_t) e < base_blobs),
+                    "loan backups displaced the ranked non-GPU complement");
+            require(rig.src.has_resident(0, e) == ((uint64_t) e >= kExperts - backed),
+                    "loan backups did not take the highest GPU slots first");
+        }
+        for (int64_t e = kExperts - (int64_t) backed; e < kExperts; ++e) {
+            const uint8_t* bytes = rig.src.blob(0, e);
+            require(bytes == rig.src.resident_blob(0, e), "backed loan did not resolve into resident RAM");
+            require(std::memcmp(bytes, rig.truth[(size_t) e].data(), rig.blob) == 0,
+                    "backed loan bytes differ from the expert source");
+        }
+        require(rig.src.file_reads() == 0 && rig.src.file_read_bytes() == 0,
+                "a backed single-GPU loan read the model file");
+        if (backed < 2) {
+            const uint8_t* bytes = rig.src.blob(0, 2);
+            require(bytes != nullptr && std::memcmp(bytes, rig.truth[2].data(), rig.blob) == 0,
+                    "an unbacked loan lost its exact file fallback");
+            require(rig.src.file_reads() == 1 && rig.src.file_read_bytes() == rig.blob,
+                    "an unbacked loan did not report exactly one file read");
+        }
+    }
+}
+
 // the #848 shape, with no stage regions set: with the later stage's pairs handed over as
 // `additional_gpu_pairs` the copy keeps NOTHING (the complement is empty and the single lend region is off), so
 // this is the state that measured 3.7 GB of NVMe reads over one 73K-token prompt on 2026-10-06
@@ -209,6 +254,7 @@ int main() {
     try {
         test_split_lend_region_served_from_ram();
         test_split_lend_region_budget();
+        test_single_budgeted_lend_regions();
         test_split_without_regions_keeps_nothing();
         std::cout << "split_lend_complement_test: PASS\n";
         return 0;

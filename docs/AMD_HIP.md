@@ -39,6 +39,9 @@ the kernel's amdgpu driver (no ROCm install needed):
 - **Engine:** compiled on your PC for the card's architecture (10-20 minutes, once; again after a `git pull` that
   changes it, or when you pick a card of another architecture). This needs a C++ compiler and git
   (`sudo apt install build-essential git`).
+- **Budgeted resident experts:** `--resident-budget-gib` also backs up GPU-cache slots borrowed for prefill when
+  room remains after the ranked non-GPU experts. Both copies share the same admitted budget and RAM headroom checks.
+  Startup reports the backed loan slots; slots beyond the budget retain the model-file fallback.
 - **hipBLASLt tuning table:** setup uses `tools/hip/<arch>-hipblaslt-<version>.txt` only when it matches both the
   card's architecture and the installed hipBLASLt version (read from `hipblaslt-version.h`; 1.2.0 is `100200`).
   Otherwise it says so and the prompt's dense matrix products use plain hipBLAS (slower prompts, same answers).
