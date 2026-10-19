@@ -3718,6 +3718,7 @@ class Service:
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         nf_retried = False                              # #879: the request was sent again after non-finite logits
+        died_retried = False                            # the request was sent again after the engine died
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
@@ -3811,6 +3812,7 @@ class Service:
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        retry_died = False              # the engine died before this pass's first token
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -3893,7 +3895,12 @@ class Service:
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
-                            raise
+                            # nothing generated yet (e.g. a hang its watchdog ended while reading the prompt): start
+                            # the engine again and send the request once more instead of failing it
+                            if n == 0 and not par and not died_retried and not cancel.is_set():
+                                died_retried = retry_died = True
+                            else:
+                                raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
                             print(f"[strata] the engine reported an error: {e}", flush=True)
@@ -3909,11 +3916,22 @@ class Service:
                             except EngineSilent as e:   # #481: the STOP was never acknowledged: the engine is ended
                                 finish = "error"
                                 self._say_died(e)
-                                if not leaving and not cancel.is_set():
+                                if not leaving and not cancel.is_set() and not retry_died:
                                     raise
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if retry_died:
+                            del segments[segments_before:]
+                            finish = "length"
+                            print("[strata] the engine stopped before the first token; starting it again and sending "
+                                  "the request once more", flush=True)
+                            with self.status_lock:
+                                st.update(phase="restarting the engine")
+                            self.ensure_loaded()
+                            with self.status_lock:
+                                st.update(phase="reading the prompt")
+                            continue
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
