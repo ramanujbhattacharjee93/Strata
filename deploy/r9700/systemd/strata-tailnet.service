@@ -1,0 +1,13 @@
+[Unit]
+Description=Private Strata tailnet-to-loopback proxy
+Requires=strata-r9700.service
+After=strata-r9700.service
+
+[Service]
+ExecStartPre=/usr/bin/curl --fail --silent --show-error --retry 45 --retry-delay 2 --retry-connrefused --retry-max-time 120 --max-time 3 --output /dev/null http://127.0.0.1:8080/health
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=300s 127.0.0.1:8080
+NoNewPrivileges=yes
+UMask=0077
+MemoryMax=32M
+TasksMax=16
+TimeoutStartSec=150

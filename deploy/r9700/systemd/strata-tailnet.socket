@@ -1,0 +1,10 @@
+[Unit]
+Description=Private Strata tailnet listener
+
+[Socket]
+ListenStream=100.64.0.7:8080
+FreeBind=yes
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target

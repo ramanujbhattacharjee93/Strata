@@ -1,0 +1,25 @@
+{
+ "source": "local-hip",
+ "backend": "hip",
+ "version": "0.1.43",
+ "archs": [
+  "gfx1201"
+ ],
+ "vision": "cpu",
+ "lib_dirs": [
+  "/opt/rocm/core-10.1/lib"
+ ],
+ "src": "b6ad658ba2d49a3e",
+ "local_patches": [
+  "budgeted-single-gpu-loan-backups",
+  "opt-in-checkpoint-buffer-recycle",
+  "prefill-expert-128-row-tiles",
+  "prefill-expert-scale-layout"
+ ],
+ "git_commit": "cfe55e3b7a2086d3c24386d60d9f4c4baea769ba",
+ "git_branch": "r9700-prefill-residency",
+ "git_diff_sha256": "7274fe17cd1f091c83fa8d3e4b339b152315a9e43cc1b0ef474a4b4b44e5288b",
+ "binary_sha256": "3f183e4ea1f180571b6f730798c09d140eac4d33b94bd8fbc3bba8422bb24bf2",
+ "vision_binary_sha256": "7ded236af79b9e98af6575f0b58dd5115883f38bbbdda4cbc625c63759249754",
+ "vision_projector_sha256": "6cbb8943b156bed0aca85a48a2d33f1c820885c5787447b0c37985f54809b0fe"
+}

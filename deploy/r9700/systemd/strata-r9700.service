@@ -1,0 +1,21 @@
+[Unit]
+Description=Strata R9700 private LLM server
+
+[Service]
+Type=simple
+WorkingDirectory=/home/rambhatt/.local/opt/Strata
+ExecStart=/home/rambhatt/.local/opt/Strata/.venv/bin/python /home/rambhatt/.local/opt/Strata/serve/server.py --engine strata --config /home/rambhatt/.local/opt/Strata/strata-unsloth-ud-iq4_xs.json --port 8080
+Environment=PYTHONUNBUFFERED=1
+Environment=ROCM_PATH=/opt/rocm/core-10.1
+Environment=HIP_PATH=/opt/rocm/core-10.1
+Environment=LD_LIBRARY_PATH=/opt/rocm/core-10.1/lib
+UMask=0077
+NoNewPrivileges=yes
+# The config's 50 GiB expert ceiling is not total process RAM.
+MemoryAccounting=yes
+MemoryMax=58G
+MemorySwapMax=0
+OOMPolicy=stop
+Restart=no
+KillMode=control-group
+TimeoutStopSec=30
