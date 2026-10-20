@@ -300,6 +300,22 @@ std::vector<int32_t> download_i(const Dev& d, size_t n) {
 }
 
 // part 1: against the double-precision reference
+// STRATA_TEST_DUMP=PATH: a 64-bit FNV-1a hash of the fused outputs' bytes in pair order (independent of the slots'
+// order) appended to PATH, for a byte comparison of two builds or kernel variants
+void dump_pairs(const char* part, const Pair& p, const std::vector<float>& y, const std::vector<int32_t>& slot, int64_t rows) {
+    const char* base = std::getenv("STRATA_TEST_DUMP");
+    if (base == nullptr) return;
+    uint64_t h = 1469598103934665603ull;
+    for (int64_t i = 0; i < rows; ++i) {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(y.data() + (size_t) slot[(size_t) i] * N);
+        for (size_t j = 0; j < (size_t) N * 4; ++j) h = (h ^ b[j]) * 1099511628211ull;
+    }
+    FILE* f = std::fopen(base, "ab");
+    if (f == nullptr) throw std::runtime_error(std::string("dump: cannot open ") + base);
+    std::fprintf(f, "%s %s %016llx\n", p.name, part, (unsigned long long) h);
+    std::fclose(f);
+}
+
 void reference_part(const Pair& p, cudaStream_t s) {
     constexpr int T = 256, E = 64, ZERO = 77;
     const Geo geo(p);
@@ -343,6 +359,7 @@ void reference_part(const Pair& p, cudaStream_t s) {
     const std::vector<int32_t> slot = download_i(fb.slot, (size_t) rows), fsrc = download_i(fb.src, (size_t) rows);
     for (int64_t i = 0; i < rows; ++i)
         if (fsrc[(size_t) slot[(size_t) i]] != (int32_t) (i / K)) throw std::runtime_error("group: slot/src disagree");
+    dump_pairs("ref", p, y_f, slot, rows);
 
     // the reference, an expert at a time on all cores
     std::vector<float> ref((size_t) rows * N), ref2((size_t) rows * N);   // ref2: the same with the kernels' int8 rounding
@@ -566,6 +583,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
             throw std::runtime_error(std::string(p.name) + ": the grouping is wrong");
         }
     }
+    dump_pairs(("T" + std::to_string(T)).c_str(), p, y_f, slot, rows);
     if (std::getenv("S20_ROWDIAG")) {   // the pairs whose rows differ most: expert, its rows, the row's place
         const std::vector<int32_t> fsrc = download_i(fb.src, (size_t) rows);
         std::vector<std::pair<double, size_t>> worst;
@@ -657,7 +675,9 @@ int main(int argc, char** argv) {
             {GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, "Q5_K / Q5_1"},         {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"},
             // the Coder IQ1_M pack's other pairs (appended: the default timing set takes pairs 0, 1, 4, 3 by index)
             {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, "IQ2_S / IQ4_NL"},   {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, "IQ3_XXS / Q2_0"},
-            {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, "IQ3_S / Q2_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, "IQ4_XS / IQ4_NL"}};
+            {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, "IQ3_S / Q2_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, "IQ4_XS / IQ4_NL"},
+            // Unsloth UD-IQ4_XS's other layers: 4 IQ3_S / Q8_0, one IQ4_XS / Q8_0
+            {GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0, "IQ3_S / Q8_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0, "IQ4_XS / Q8_0"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
