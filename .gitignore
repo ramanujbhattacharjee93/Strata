@@ -61,3 +61,12 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# Private deployment backups, local profiler output, and benchmark receipts.
+/backups/
+/.rocprofv3/
+/first-inference-result.json
+/inference-*-result.json
+/ntfs-driver-*.json
+/ntfs3-prompt-transaction.json
+/table-io-comparison.json
