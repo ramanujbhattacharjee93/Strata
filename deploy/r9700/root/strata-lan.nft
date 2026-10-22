@@ -1,0 +1,9 @@
+# Strata LAN listener: only valhalla-core may reach 192.168.50.75:8080.
+table inet strata_lan
+delete table inet strata_lan
+table inet strata_lan {
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		ip daddr 192.168.50.75 tcp dport 8080 ip saddr != 192.168.50.215 counter drop
+	}
+}

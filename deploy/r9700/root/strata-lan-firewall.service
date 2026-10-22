@@ -1,0 +1,15 @@
+[Unit]
+Description=Strata LAN listener firewall (only valhalla-core may reach 192.168.50.75:8080)
+Before=user@1000.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/strata-lan/strata-lan.nft
+ExecStart=/usr/bin/touch /run/strata-lan-firewall.ok
+ExecStop=/usr/bin/rm -f /run/strata-lan-firewall.ok
+ExecStop=-/usr/sbin/nft delete table inet strata_lan
+
+[Install]
+WantedBy=multi-user.target

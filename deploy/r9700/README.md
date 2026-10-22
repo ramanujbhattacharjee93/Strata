@@ -78,3 +78,9 @@ guarantee. No OOM or service swap occurred; minimum host-available RAM was 3.31 
 Batch proposal acceptance comes from native batch summaries, not the API's solo-drafter counters.
 Future production adoption must compare uncached first-admission prefill on identical inputs, not just
 functional correctness, memory safety, or aggregate decode throughput.
+
+LAN listener (valhalla-core only): `systemd/strata-lan.socket` + `strata-lan.service` proxy 192.168.50.75:8080 to
+Strata's loopback port for LiteLLM on valhalla-core. Access control is a root nftables table (`root/strata-lan.nft`)
+that drops port 8080 on 192.168.50.75 from any source except 192.168.50.215, loaded at boot by
+`root/strata-lan-firewall.service` (install: `sudo sh root/install-strata-lan-firewall.sh`). The socket only listens
+when `/run/strata-lan-firewall.ok` exists, so it fails closed. systemd IPAddressAllow/Deny is not enforced in user units.

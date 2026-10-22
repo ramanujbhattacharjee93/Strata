@@ -1,0 +1,12 @@
+[Unit]
+Description=Private Strata LAN listener (valhalla-core only)
+# Fail closed: listen only once the root firewall (strata-lan-firewall.service) has loaded.
+ConditionPathExists=/run/strata-lan-firewall.ok
+
+[Socket]
+ListenStream=192.168.50.75:8080
+FreeBind=yes
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target
