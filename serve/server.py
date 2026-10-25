@@ -3896,8 +3896,9 @@ class Service:
                             finish = "error"
                             self._say_died(e)
                             # nothing generated yet (e.g. a hang its watchdog ended while reading the prompt): start
-                            # the engine again and send the request once more instead of failing it
-                            if n == 0 and not par and not died_retried and not cancel.is_set():
+                            # the engine again and send the request once more instead of failing it - with parallel
+                            # slots too: every request of the dead engine that had no token yet is sent again once
+                            if n == 0 and not died_retried and not cancel.is_set():
                                 died_retried = retry_died = True
                             else:
                                 raise
@@ -3928,7 +3929,11 @@ class Service:
                                   "the request once more", flush=True)
                             with self.status_lock:
                                 st.update(phase="restarting the engine")
-                            self.ensure_loaded()
+                            if par:                     # parallel requests do not hold the fifo: the first one to
+                                with self.fifo:         # get it starts the engine, the others find it loaded
+                                    self.ensure_loaded()
+                            else:
+                                self.ensure_loaded()
                             with self.status_lock:
                                 st.update(phase="reading the prompt")
                             continue
