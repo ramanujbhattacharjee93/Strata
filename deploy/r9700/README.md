@@ -36,6 +36,22 @@ The native binary is unchanged from `BUILD.json`; these are runtime settings, no
 The root runtime config, backups, profiler captures, full benchmark responses, and model assets are
 not part of this snapshot.
 
+## Decode fusions, 2026-10-25
+
+The engine is built from `r9700-prefill-residency` at the decode-fusion commit (`BUILD.json`). Four opt-in
+switches are on in the config:
+
+- `STRATA_FZ_COMMIT=1`: the 36 GDN layers' conv and state commits in two launches per window.
+- `STRATA_FZ_PAIR=1`: the shared expert's gate and up projections in one launch.
+- `STRATA_FZ_ROUTE=1`: the router top-10 and the doorbell publish in one launch.
+- `STRATA_FZ_NOPCIE=1`: no expert is staged over PCIe; misses run on the CPU pool, and the verify graph drops
+  the PCIe branch (six kernels per layer). This replaces the auto `pcie_frac` (0.55).
+
+The first three are bitwise: greedy output, acceptance and hit rates matched the previous binary exactly.
+Measured on two uncached 64K prompts with MTP on: about 2.2% less time per window from those three, and 3-4% with
+`STRATA_FZ_NOPCIE`. Two concurrent 64K prompts: 48.62 -> 46.72 ms per window (+5.9% rows/s) from adding
+`STRATA_FZ_NOPCIE`. Prefill was unchanged (above 3,200 tok/s). Removing a switch restores the previous path.
+
 ## Measurements and the rejected third slot
 
 Earlier warm 32K prefill measured about 3,375 tok/s (about 3,190 before the 128-row expert work items and
