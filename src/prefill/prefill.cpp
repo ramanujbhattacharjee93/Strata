@@ -1,5 +1,7 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/native_dense.hpp"
+#include "strata/kernels/fused_gr.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
@@ -754,6 +756,7 @@ struct Prefill::Impl {
     uint16_t *mixed_bf = nullptr, *mixed_h = nullptr;
     bool f16_io = false;   // HIP, STRATA_HIP_PROMPT_F16=1: this stage's 16-bit GEMMs run FP16 in and out (set in init)
     uint16_t *xn16_lo = nullptr, *lo16_lo = nullptr, *mixed_bf_lo = nullptr;   // bf16x2(): the BF16 GEMMs' low parts
+    uint16_t* hc_bf16[2] = {nullptr, nullptr};   // STRATA_HC_Q8=2: this half's down / up rows, dequantized on cs
     float* bo = nullptr;
     // GDN
     float *qkv = nullptr, *z = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *hbuf = nullptr, *y = nullptr;
@@ -1084,6 +1087,17 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_up.init((size_t) chunk);
     }
     if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+    if (core::hc_q8_replace() && m.hc_bf16[0] == nullptr) {   // STRATA_HC_Q8=2: the BF16 rows are not in the arena
+        const size_t n = (size_t) (g.hc * g.n_embd) * (size_t) g.hc_lr;
+        for (uint16_t*& p : m.hc_bf16) {
+            if (cudaMalloc((void**) &p, n * sizeof(uint16_t)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                err = "prefill: the hyper-connection dequantization buffers (STRATA_HC_Q8=2) do not fit";
+                return false;
+            }
+            m.owned.push_back(p);
+        }
+    }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
@@ -2539,6 +2553,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
+                // STRATA_HC_Q8=2: the down/up rows exist as the GGUF's Q8_0 only - dequantized here, on this stage's
+                // stream, to the BF16 values the pack would hold (bit for bit), for this half's GEMMs
+                core::WeightRef wd_q, wu_q;
+                if (wd->data == nullptr && wd->hc_q8 != nullptr && m.hc_bf16[0] != nullptr) {
+                    strata::kernels::hc_q8_to_bf16(wd->hc_q8, m.hc_bf16[0], wd->ne0 * wd->ne1, m.cs);
+                    wd_q = *wd; wd_q.data = m.hc_bf16[0]; wd = &wd_q;
+                }
+                if (wu->data == nullptr && wu->hc_q8 != nullptr && m.hc_bf16[1] != nullptr) {
+                    strata::kernels::hc_q8_to_bf16(wu->hc_q8, m.hc_bf16[1], wu->ne0 * wu->ne1, m.cs);
+                    wu_q = *wu; wu_q.data = m.hc_bf16[1]; wu = &wu_q;
+                }
+                if (wd->data == nullptr || wu->data == nullptr) {
+                    err = "prefill: " + sd + " has no BF16 rows and no Q8_0 bytes";
+                    return false;
+                }
                 pt.mark(kPfHc, cs);
                 // the xn16 token stride of this chunk (the writers of both halves and of the fused write-backs use it)
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&

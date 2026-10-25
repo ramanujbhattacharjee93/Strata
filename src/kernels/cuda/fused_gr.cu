@@ -1827,6 +1827,22 @@ int g_gr_fast = -1;
 #endif
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 
+namespace {
+__global__ void hc_q8_to_bf16_kernel(const uint8_t* __restrict__ q8, uint16_t* __restrict__ out, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint8_t* blk = q8 + (size_t) (i >> 5) * 34;
+    const float d = __half2float(__ushort_as_half(*(const unsigned short*) blk));
+    const float v = __fmul_rn(d, (float) (int8_t) blk[2 + (i & 31)]);
+    const uint32_t u = __float_as_uint(v);
+    out[i] = (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);   // finite inputs: ggml's nearest-even
+}
+}  // namespace
+void hc_q8_to_bf16(const void* q8, uint16_t* out, int64_t n, void* stream) {
+    if (n <= 0) return;
+    hc_q8_to_bf16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>((const uint8_t*) q8, out, n);
+}
+
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
@@ -1837,7 +1853,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     for (int t = 0; t < n_tok; ++t) {
         m.a[t] = a[t];
         const FusedGrArgs& x = a[t];
-        if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
+        if (!x.R || !x.w_norm || (!x.w_down && !x.q8_down) || (!x.w_up && !x.q8_up) || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm || x.q8_down != a[0].q8_down ||
             x.q8_up != a[0].q8_up || x.q8_inject != a[0].q8_inject) {

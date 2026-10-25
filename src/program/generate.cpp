@@ -2924,6 +2924,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (native_pack) skip.insert("token_embd.weight");
+        // STRATA_HC_Q8=2: the layers' hyper-connection down/up rows come from the GGUF's Q8_0 bytes only
+        if (strata::core::hc_q8_replace() && !o.native_dense_gguf.empty() &&
+            !strata::core::NativeDense::hc_q8_replaced_names(o.native_dense_gguf, skip, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the
