@@ -45,6 +45,9 @@ struct ExpertLayout;
 
 namespace strata::core {
 
+/// STRATA_FZ_NOPCIE=1 (decode-fusion): no miss is ever staged over PCIe, so the verify graph captures no PCIe branch.
+bool fz_nopcie();
+
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
 struct LoadStats;

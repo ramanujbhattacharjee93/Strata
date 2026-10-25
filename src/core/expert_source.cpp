@@ -3466,6 +3466,11 @@ const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) con
     return complement_device_ + (size_t) complement_offsets_[index];
 }
 
+bool fz_nopcie() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FZ_NOPCIE"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
 bool FileExpertSource::pcie_layer(int64_t layer) const {
     if (complement_ready_ && complement_pinned_ && complement_device_ != nullptr)
         return layer >= 0 && layer < n_layers_;
@@ -3711,7 +3716,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++d.tail_experts;
             }
         }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
+        const bool pcie_ok = d.pcie_num > 0 && !fz_nopcie() && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;

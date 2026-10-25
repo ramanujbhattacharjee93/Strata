@@ -27,6 +27,13 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0, bool commit = false);
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
+/// decode-fusion STRATA_FZ_COMMIT=1: n_layers consecutive GDN layers' conv + state commits in two launches (layer i's
+/// state at state0 + i * state_stride, its conv history conv_off floats in; qkv / h at i * th_stride; gate / beta at
+/// i * gb_stride).  Bitwise gdn_conv_commit + gdn_step_norm_multi's commit per layer when gdn_commit_layers_ok().
+bool gdn_commit_layers_ok();
+void gdn_commit_layers(float* state0, long long state_stride, long long conv_off, const float* qkv0, const float* h0,
+                       long long th_stride, const float* gate0, const float* beta0, long long gb_stride, int C, int h_k,
+                       int h_v, int n_layers, const int32_t* n_keep, void* stream);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
 /// gdn_conv_l2_multi and gdn_ab_multi in one launch (143-amdk)
 void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,

@@ -148,6 +148,93 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
+// decode-fusion STRATA_FZ_ROUTE=1: route_multi and doorbell_publish_res_kernel in one launch for 1..8 tokens (one block).
+// Each warp routes its token with route_multi's code verbatim; after a block barrier the block publishes the ids (and the
+// rows when any expert misses) exactly as doorbell_publish_res_kernel does, with 256 threads instead of 1024.
+__launch_bounds__(256, 1)
+__global__ void route_multi_publish_res(const float* __restrict__ logits_all, int32_t* __restrict__ ids_all,
+                                        float* __restrict__ weights_all, int n_tok, const float* __restrict__ x,
+                                        const int32_t* __restrict__ d_res, int n_expert, int n, int k, float* x_out,
+                                        int32_t* ids_out, uint32_t* seq) {
+    const int tk = (int) threadIdx.y;
+    if (tk < n_tok) {
+        const float* __restrict__ logits = logits_all + (size_t) tk * 512;
+        int32_t* __restrict__ ids = ids_all + (size_t) tk * 10;
+        float* __restrict__ weights = weights_all + (size_t) tk * 10;
+        const int lane = threadIdx.x;
+        float values[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+        __syncwarp();
+        float maximum = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+        maximum = warp_max(maximum);
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            values[i] = expf(values[i] - maximum);
+            sum += values[i];
+        }
+        const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            values[i] *= reciprocal;
+            if (__isnanf(values[i])) values[i] = -FLT_MAX;
+        }
+        float selected = 0.0f, selected_sum = 0.0f;
+        for (int rank = 0; rank < 10; ++rank) {
+            float best = values[0];
+            int expert = lane;
+#pragma unroll
+            for (int i = 1; i < 16; ++i) {
+                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+            }
+#pragma unroll
+            for (int mask = 16; mask; mask >>= 1) {
+                const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+                const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+                if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+            }
+            if ((expert & 31) == lane) {
+                values[expert / 32] = -INFINITY;
+                ids[rank] = expert;
+                selected_sum += best;
+            }
+            if (rank == lane) selected = best;
+        }
+        selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+        const float inverse_selected_sum = 1.0f / selected_sum;
+        if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+    }
+    __syncthreads();
+    const int tid = (int) threadIdx.y * 32 + (int) threadIdx.x;
+    int any_miss = 0;
+    if (tid < k) {
+        const int32_t id = ids_all[tid];
+        ids_out[tid] = id;
+        if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) any_miss = 1;
+    }
+    if (__syncthreads_or(any_miss)) {
+        if ((n & 3) == 0 && ((uintptr_t) x & 15) == 0 && ((uintptr_t) x_out & 15) == 0) {
+            const float4* x4 = reinterpret_cast<const float4*>(x);
+            float4* o4 = reinterpret_cast<float4*>(x_out);
+            for (int i = tid; i < n / 4; i += 256) o4[i] = x4[i];
+        } else {
+            for (int i = tid; i < n; i += 256) x_out[i] = x[i];
+        }
+        __threadfence_system();
+    } else if (tid < k) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (tid == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+#if defined(__HIPCC__)
+        __threadfence_system();
+#endif
+    }
+}
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -173,6 +260,19 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
     route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void native_router_top10_multi_publish_res(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
+                                           const int32_t* d_res, int n_expert, int64_t n, int64_t k, float* x_out,
+                                           int32_t* ids_out, uint32_t* seq, void* stream) {
+    if (!stream || n_tok < 1 || n_tok > 8 || k > 256 || k != (int64_t) n_tok * 10 ||
+        !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
+        !valid(weights, (size_t) n_tok * 10 * 4))
+        throw std::invalid_argument("native router + publish: 1..8 tokens, aligned [n,512]/[n,10] buffers");
+    route_multi_publish_res<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+        logits, ids, weights, n_tok, x, d_res, n_expert, (int) n, (int) k, x_out, ids_out, seq);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

@@ -218,6 +218,75 @@ __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restr
     for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
 }
 
+// decode-fusion STRATA_FZ_COMMIT=1: every GDN layer's conv-history and state commit in one launch each, the layer in
+// blockIdx.y / blockIdx.z at a fixed stride.  Per layer these are gdn_conv_commit_kernel / gdn_step_commit_kernel<false>
+// verbatim (copies, so the per-layer kernels and their code generation are untouched).
+__global__ void gdn_conv_commit_layers_kernel(float* __restrict__ hist0, long long hist_stride,
+                                              const float* __restrict__ qkv0, long long qkv_stride, int C,
+                                              const int32_t* __restrict__ n_keep) {
+    float* __restrict__ hist = hist0 + (size_t) blockIdx.y * (size_t) hist_stride;
+    const float* __restrict__ qkv = qkv0 + (size_t) blockIdx.y * (size_t) qkv_stride;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int n = *n_keep;
+    if (n <= 0) return;
+    float seq[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int src = n + j;          // the last three of [hist(3) | x_0..x_{n-1}]
+        seq[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
+    }
+    hist[c * 3] = seq[0];
+    hist[c * 3 + 1] = seq[1];
+    hist[c * 3 + 2] = seq[2];
+}
+
+__global__ void __launch_bounds__(32 * RG) gdn_step_commit_layers_kernel(float* __restrict__ state0, long long state_stride,
+                                                                         const float* __restrict__ h0, long long h_stride,
+                                                                         int C, const float* __restrict__ gate0,
+                                                                         const float* __restrict__ beta0, long long gb_stride,
+                                                                         int h_k, int h_v,
+                                                                         const int32_t* __restrict__ n_keep) {
+    float* __restrict__ state = state0 + (size_t) blockIdx.z * (size_t) state_stride;
+    const float* __restrict__ hbuf = h0 + (size_t) blockIdx.z * (size_t) h_stride;
+    const float* __restrict__ gate = gate0 + (size_t) blockIdx.z * (size_t) gb_stride;
+    const float* __restrict__ beta = beta0 + (size_t) blockIdx.z * (size_t) gb_stride;
+    const int n = *n_keep;
+    if (n <= 0) return;
+    __shared__ float sk[S];
+    __shared__ float red[RG][32];
+    const int head = blockIdx.x;
+    const int col_local = threadIdx.x;
+    const int col = blockIdx.y * 32 + col_local;
+    const int rg = threadIdx.y;
+    const int tid = rg * 32 + col_local;    // 0 .. 127
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int t = 0; t < n; ++t) {
+        const float* ht = hbuf + (size_t) t * C;
+        __syncthreads();
+        sk[tid] = ht[qk + qh * S + tid];
+        __syncthreads();
+        const float g = __expf(gate[(size_t) t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red[rg][col_local] = kv;
+        __syncthreads();
+        const float kv_col = red[0][col_local] + red[1][col_local] + red[2][col_local] + red[3][col_local];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+}
+
 // S26 (STRATA_QFUSE=1): the q8_1 image of a 32-column block, written by the warp that holds those columns with
 // native_quantize_q8_1_kernel's quantizer (the same XOR-tree max and sum, d = amax / 127, roundf(x / d), ds = (d, sum)).
 struct GdnQ81 { half2 ds; int8_t qs[32]; };
@@ -962,6 +1031,27 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
         default: gdn_conv_ab_kernel<kVerifyMaxT, false><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
     }
     check("gdn_conv_ab_multi");
+}
+
+bool gdn_commit_layers_ok() {
+    // the per-layer commit would be gdn_step_commit_kernel<false>: no STRATA_GDN_SPLIT=1, STRATA_GDN_COMMIT_SPLIT=0 or
+    // STRATA_DBG_GDN=1 (the same environment gdn_step_norm_multi reads)
+    const char* sp = std::getenv("STRATA_GDN_SPLIT");
+    const char* cs = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+    const char* db = std::getenv("STRATA_DBG_GDN");
+    return !(sp && sp[0] == '1') && !(cs && cs[0] == '0') && !(db && db[0] == '1');
+}
+
+void gdn_commit_layers(float* state0, long long state_stride, long long conv_off, const float* qkv0, const float* h0,
+                       long long th_stride, const float* gate0, const float* beta0, long long gb_stride, int C, int h_k,
+                       int h_v, int n_layers, const int32_t* n_keep, void* stream) {
+    if (n_layers <= 0) return;
+    cudaStream_t st = (cudaStream_t) stream;
+    gdn_conv_commit_layers_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) n_layers), 256, 0, st>>>(
+        state0 + conv_off, state_stride, qkv0, th_stride, C, n_keep);
+    gdn_step_commit_layers_kernel<<<dim3((unsigned) h_v, 4u, (unsigned) n_layers), dim3(32, RG), 0, st>>>(
+        state0, state_stride, h0, th_stride, C, gate0, beta0, gb_stride, h_k, h_v, n_keep);
+    check("gdn_commit_layers");
 }
 
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {

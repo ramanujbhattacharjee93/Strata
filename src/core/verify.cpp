@@ -131,6 +131,8 @@ RouteResidentCfg& route_resident_cfg() {
     return c;
 }
 inline bool g_lfuse_gate() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_GATE"); return v == nullptr || v[0] != '0'; }(); return on; }
+// decode-fusion STRATA_FZ_PAIR=1: the shared expert's gate + up in one launch (native_mmvq_pair, bitwise) without all-resident
+inline bool g_fz_pair() { static const bool on = [] { const char* v = std::getenv("STRATA_FZ_PAIR"); return v != nullptr && v[0] == '1'; }(); return on; }
 inline bool g_lfuse_pair() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_PAIR"); return v == nullptr || v[0] != '0'; }(); return on; }
 inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv("STRATA_VERIFY_QDEDUP"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 // S26 STRATA_QFUSE=1: activation q8_1 images written by their producers (the GDN output norm) - the same bytes
@@ -1435,6 +1437,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+        // decode-fusion STRATA_FZ_ROUTE=1: the top-10 and the doorbell publish in one launch where nothing runs between
+        // them (no route prior / resident routing, a host plan published by doorbell_publish_res)
+        static const bool fz_route_env = [] { const char* v = std::getenv("STRATA_FZ_ROUTE"); return v != nullptr && v[0] == '1'; }();
+        static const bool fz_route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v != nullptr && std::atof(v) > 0.0; }();
+        bool fz_route_now = fz_route_env && dec_batch && n > 1 && n <= 8 && w_router != nullptr && native_router_enabled() &&
+                            NE == 512 && K == 10 && !ar_on() && !device_plan_ && !remote_opt_ && !always_publish_ &&
+                            !fz_route_prior && !(route_resident_cfg().margin > 0.0f);
+#if defined(STRATA_USE_HIP)
+        if (g_doorbell_store) fz_route_now = false;
+#endif
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -1444,6 +1456,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                if (fz_route_now)
+                    native_router_top10_multi_publish_res(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm,
+                                                          hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr,
+                                                          (int) g.n_expert, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                                                          m_ids_ + tb * K, m_seq_, cs);
+                else
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
@@ -1495,7 +1513,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (remote_opt_ || always_publish_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-            else {
+            else if (!fz_route_now) {   // decode-fusion: published by the router launch when fused
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
@@ -1532,7 +1550,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
-                                    (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
+                                    (sg_ready ? 1 : 0) | ((lfuse_on(n) || (g_fz_pair() && dec_batch && n > 1 && n <= 8)) && g_lfuse_pair() ? 2 : 0));
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
@@ -1606,6 +1624,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
+            const bool fz_skip_pcie = fz_nopcie() && !device_plan_;   // decode-fusion: the planner never stages over PCIe
+            if (!fz_skip_pcie) {
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
@@ -1619,6 +1639,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
             stamp(l, 22, grp);
+            }
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
@@ -1990,9 +2011,24 @@ bool Verifier::capture_commit(std::string& err) {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        // decode-fusion STRATA_FZ_COMMIT=1: the stage's GDN layers (consecutive GDN indices) committed in two launches
+        static const bool fz_commit = [] { const char* v = std::getenv("STRATA_FZ_COMMIT"); return v != nullptr && v[0] == '1'; }();
+        const bool commit_batched = fz_commit && gdn_commit_layers_ok();
+        if (commit_batched) {
+            int64_t n_gdn = 0;
+            for (int64_t l = lb_; l < le_; ++l) n_gdn += is_qsa_layer(g, l) ? 0 : 1;
+            float* state0 = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
+            gdn_commit_layers(state0, (long long) gdn_floats,
+                              (long long) ((uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size),
+                              qkv_L_ + (size_t) gdn_index * MT * C, h_L_ + (size_t) gdn_index * MT * C, (long long) (MT * C),
+                              gate_L_ + (size_t) gdn_index * MT * HV, beta_L_ + (size_t) gdn_index * MT * HV,
+                              (long long) (MT * HV), (int) C, (int) g.ssm_k_heads, (int) HV, (int) n_gdn, commit_, cs_);
+        }
         for (int64_t l = lb_; l < le_ && ok; ++l) {
             const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
+            if (!is_qsa_layer(g, l) && commit_batched) {
+                ++gdn_index;
+            } else if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
                 float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
