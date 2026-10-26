@@ -1218,6 +1218,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
 
 // Every device buffer of a chunk of T tokens, from the Alloc `alloc` (after the GEMM scratch and workspace): `init`
 // once, and `relayout` for a request's own chunk.  The order is `bytes_needed`'s.
+void Prefill::set_session(core::SessionState& ss) { impl_->ss = &ss; }
+
 bool Prefill::carve(size_t T, void* alloc) {
     Impl& m = *impl_;
     Alloc& o = *static_cast<Alloc*>(alloc);

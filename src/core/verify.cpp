@@ -490,6 +490,12 @@ Verifier::~Verifier() {
     for (auto& e : exec_nr_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+    for (auto& [who, set] : solo_sets_) {   // STRATA_SLOT_POOL: the other sessions' solo graphs
+        if (who == ss_) continue;
+        for (auto& e : set.exec) if (e) cudaGraphExecDestroy(e);
+        for (auto& e : set.exec_nr) if (e) cudaGraphExecDestroy(e);
+        if (set.commit) cudaGraphExecDestroy(set.commit);
+    }
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
     for (auto& kv : commit_bm_)
@@ -2612,6 +2618,31 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
                  (long long) lb_, (long long) le_);
+    return true;
+}
+
+bool Verifier::bind_session(SessionState& s, std::string& err) {
+    if (&s == ss_) return true;
+    if (ss_ == nullptr || g_ == nullptr) { err = "verify: bind_session before init"; return false; }
+    if (s.layer_lo != ss_->layer_lo || s.layer_hi != ss_->layer_hi || s.max_cells != ss_->max_cells ||
+        s.gdn_ord0 != ss_->gdn_ord0 || s.qsa_ord0 != ss_->qsa_ord0 || s.k != ss_->k) {
+        err = "verify: bind_session: the session is not carved like the stage's own (layer range, context)";
+        return false;
+    }
+    if (!wait_commit(err)) return false;
+    const OnDevice on_device(device_);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("verify: bind_session: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    SoloGraphs& out = solo_sets_[ss_];
+    for (int i = 0; i < 9; ++i) { out.exec[i] = exec_[i]; out.exec_nr[i] = exec_nr_[i]; }
+    out.commit = commit_exec_;
+    SoloGraphs& in = solo_sets_[&s];
+    for (int i = 0; i < 9; ++i) { exec_[i] = in.exec[i]; exec_nr_[i] = in.exec_nr[i]; }
+    commit_exec_ = in.commit;
+    in = SoloGraphs{};   // held in the members now (the destructor frees the bound set from them)
+    ss_ = &s;
     return true;
 }
 

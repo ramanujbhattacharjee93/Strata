@@ -179,6 +179,9 @@ public:
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
     /// for a chunk. Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// STRATA_SLOT_POOL: read the next prompts into another session carved like the one `init` was given (the run
+    /// reads the session's state each time; nothing in `init` depends on which session it is)
+    void set_session(core::SessionState& ss);
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.

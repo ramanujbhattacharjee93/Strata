@@ -184,6 +184,11 @@ public:
     // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
+    /// STRATA_SLOT_POOL: run the solo windows (run / commit) on another session carved like the stage's own (a batch
+    /// slot's).  Each session keeps its own captured window and commit graphs (captured on its first window).  Waits for
+    /// the commit in flight; nothing else may be running on the verifier.
+    bool bind_session(SessionState& ss, std::string& err);
+    SessionState* session() const { return ss_; }
     int n_slots() const { return (int) slots_.size(); }
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
@@ -449,6 +454,13 @@ private:
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     cudaGraphExec_t commit_exec_ = nullptr;
+    /// STRATA_SLOT_POOL: the solo graphs of the sessions not bound now (bind_session swaps them with the three above)
+    struct SoloGraphs {
+        cudaGraphExec_t exec[9] = {};
+        cudaGraphExec_t exec_nr[9] = {};
+        cudaGraphExec_t commit = nullptr;
+    };
+    std::map<SessionState*, SoloGraphs> solo_sets_;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
