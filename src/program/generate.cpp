@@ -9316,7 +9316,12 @@ int main(int argc, char** argv) {
                 pool_mtp[k]->set_source_R(solo ? ver.final_R_all() : nullptr);
             }
         };
+        int pool_said = 0;
         auto pool_bind = [&](std::string& e) -> bool {   // the solo path, the prompt reads and the verifier on main_phys
+            if (pool_said != main_phys + 1) {
+                std::fprintf(stderr, "strata batch: STRATA_SLOT_POOL: the main session is session %d\n", main_phys);
+                pool_said = main_phys + 1;
+            }
             main_ssp = pool_ss[(size_t) main_phys];
             if (!pool_mtp.empty()) main_mtpp = pool_mtp[(size_t) main_phys];
             pool_roles();
