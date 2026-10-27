@@ -54,7 +54,7 @@ Measured on two uncached 64K prompts with MTP on: about 2.2% less time per windo
 
 ## Q8 hyper-connections, two sessions and the lookup chain, 2026-10-25/26
 
-The engine is built from `two-session-redesign` (`BUILD.json`; not merged into `r9700-prefill-residency`).
+The engine is built from `two-session-redesign` (`BUILD.json`), merged into `r9700-prefill-residency` on 2026-10-26.
 Three more settings are on in the config:
 
 - `STRATA_HC_Q8=2`: the 48 layers' hyper-connection down/up projections are served from the GGUF's Q8_0 bytes only;
