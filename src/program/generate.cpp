@@ -626,6 +626,11 @@ struct Options {
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     bool session_save_reclaim = false;
+    /// --serve --conversation-disk DIR (opt-in): park conversations the main session gives up as files in DIR (their
+    /// tokens stay in RAM), up to --conversation-disk-gib, conversations of at least --conversation-disk-min-tokens
+    std::string conversation_disk;
+    int64_t conversation_disk_gib = 32;
+    int64_t conversation_disk_min_tokens = 4096;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
@@ -776,6 +781,10 @@ void usage() {
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
+                 "  --conversation-disk DIR  --serve, one GPU (opt-in): a conversation the main session gives up is\n"
+                 "                       written to DIR (as SAVE writes it) and read back when a request continues it\n"
+                 "  --conversation-disk-gib N  the files' total in DIR (default 32; the least recently used go)\n"
+                 "  --conversation-disk-min-tokens N  park only conversations of at least N tokens (default 4096)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -2008,6 +2017,11 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
+        else if (a == "--conversation-disk") o.conversation_disk = next("--conversation-disk");
+        else if (a == "--conversation-disk-gib")
+            o.conversation_disk_gib = std::max<int64_t>(1, std::atoll(next("--conversation-disk-gib")));
+        else if (a == "--conversation-disk-min-tokens")
+            o.conversation_disk_min_tokens = std::max<int64_t>(0, std::atoll(next("--conversation-disk-min-tokens")));
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
@@ -8041,6 +8055,238 @@ int main(int argc, char** argv) {
                 return true;
             }
         };
+        // ---- --conversation-disk DIR (opt-in): a conversation the main session is about to give up (another one is
+        // read into it) goes to a file in DIR - its live state, its deepest checkpoint and its K/V, streamed from the
+        // session's own pools as SAVE writes them - and a later request that continues it reads the file back instead of
+        // its prompt.  Only the tokens stay in RAM; the files' total is capped (--conversation-disk-gib, least recently
+        // used first).  The files belong to this process: what an earlier run left is deleted at the start.
+        struct DiskParked {
+            std::string path;
+            std::vector<int32_t> ids;
+            std::vector<std::vector<int32_t>> checks;   // the saved checkpoints' tokens (text only)
+            bool cvec = true;
+            uint64_t bytes = 0, used = 0;
+        };
+        std::vector<DiskParked> disk_parked;
+        uint64_t disk_bytes = 0, disk_clock = 0, disk_seq = 0;
+        const uint64_t disk_budget = (uint64_t) o.conversation_disk_gib << 30;
+        const std::string disk_stamp = std::to_string((long long) (std::chrono::system_clock::now().time_since_epoch().count() % 1000000007));
+        bool disk_on = !o.conversation_disk.empty() && o.serve && o.prompt_cache > 0 && stages.empty() && !multi_gpu &&
+                       o.peer_device < 1;
+        if (!o.conversation_disk.empty() && !disk_on)
+            std::fprintf(stderr, "strata serve: --conversation-disk is off (it needs one GPU and --prompt-cache > 0)\n");
+        if (disk_on) {
+            std::error_code ec;
+            std::filesystem::create_directories(o.conversation_disk, ec);
+            size_t stale = 0;
+            if (!ec)
+                for (const auto& de : std::filesystem::directory_iterator(o.conversation_disk, ec)) {
+                    const std::string fn = de.path().filename().string();
+                    std::error_code e2;
+                    if (fn.rfind("conv-", 0) == 0 && fn.ends_with(".strata") && std::filesystem::remove(de.path(), e2)) ++stale;
+                }
+            const std::string probe = o.conversation_disk + "/.strata-write-probe";
+            std::FILE* f = ec ? nullptr : std::fopen(probe.c_str(), "wb");
+            if (f != nullptr) { std::fclose(f); std::error_code e3; std::filesystem::remove(probe, e3); }
+            if (f == nullptr) {
+                std::fprintf(stderr, "strata serve: --conversation-disk %s is not writable (%s): off\n",
+                             o.conversation_disk.c_str(), ec ? ec.message().c_str() : "cannot create a file");
+                disk_on = false;
+            } else {
+                std::fprintf(stderr, "strata serve: conversation disk: %s, up to %lld GiB, conversations of %lld tokens or "
+                                     "more (%zu stale file%s removed)\n", o.conversation_disk.c_str(),
+                             (long long) o.conversation_disk_gib, (long long) o.conversation_disk_min_tokens, stale,
+                             stale == 1 ? "" : "s");
+            }
+        }
+        auto disk_remove = [&](size_t i) {
+            std::error_code ec;
+            std::filesystem::remove(disk_parked[i].path, ec);
+            disk_bytes -= std::min(disk_bytes, disk_parked[i].bytes);
+            disk_parked.erase(disk_parked.begin() + (std::ptrdiff_t) i);
+        };
+        auto disk_clear = [&]() -> size_t {
+            const size_t n = disk_parked.size();
+            while (!disk_parked.empty()) disk_remove(disk_parked.size() - 1);
+            return n;
+        };
+        auto disk_admit = [&o](uint64_t need, std::string& why) {
+            const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+            const auto mem = strata::core::sample_host_memory();
+            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+            why = "not enough RAM (" + (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
+                  " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB, " +
+                  ram_note(mem) + ")";
+            return false;
+        };
+        // the main session's conversation to a file (best effort: a refusal or failure only says so)
+        auto disk_park = [&]() {
+            if (!disk_on || !live_ok || live.empty() || !live_imgs.empty() ||
+                (int64_t) live.size() < o.conversation_disk_min_tokens)
+                return;
+            for (DiskParked& d : disk_parked)
+                if (d.cvec == cvec_cached && d.ids == live) { d.used = ++disk_clock; return; }   // already there
+            for (size_t i = 0; i < disk_parked.size();) {   // the same conversation a turn back: superseded
+                const DiskParked& d = disk_parked[i];
+                if (d.cvec == cvec_cached && d.ids.size() < live.size() && std::equal(d.ids.begin(), d.ids.end(), live.begin()))
+                    disk_remove(i);
+                else
+                    ++i;
+            }
+            const auto t0 = Clock::now();
+            std::string e;
+            const std::string path = o.conversation_disk + "/conv-" + disk_stamp + "-" + std::to_string(++disk_seq) + ".strata";
+            try {
+                if (!ver.wait_commit(e)) { std::fprintf(stderr, "strata serve: conversation disk: %s\n", e.c_str()); return; }
+                strata::core::SessionFileIdentity id;
+                if (!session_identity(id, e, [] {})) {
+                    std::fprintf(stderr, "strata serve: conversation disk: identity: %s; not parked\n", e.c_str());
+                    return;
+                }
+                strata::core::SessionSaveLive sl;
+                {
+                    strata::core::ConversationStateSizes z;
+                    std::string why;
+                    uint64_t state = UINT64_MAX;
+                    if (strata::core::conversation_session_sizes(g, *main_ssp, z, why)) {
+                        const uint64_t q = (uint64_t) std::max<int64_t>(main_ssp->qsa_alloc, 0);
+                        const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
+                        if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
+                    }
+                    sl.state_bytes = state;
+                    sl.tokens = live.size();
+                    sl.images = 0;
+                    sl.kv_layers = (uint64_t) std::max<int64_t>(main_ssp->qsa_alloc, 0) + 1;
+                }
+                std::vector<ConvCheckpoint> disk_checks;
+                if (!strata::core::session_save_checkpoints(checks, sl, disk_admit, disk_checks, e)) {
+                    std::fprintf(stderr, "strata serve: conversation disk: %s; not parked\n", e.c_str());
+                    return;
+                }
+                const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                strata::core::SavedConversation meta;
+                std::vector<strata::core::SessionKvSource> sources;
+                strata::core::progress_at("parking a conversation on disk");
+                strata::core::progress_allow(strata::core::session_phase_limit_s(sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes));
+                if (!strata::core::conversation_snapshot_sources(meta, sources, view, *main_ssp, g,
+                                                                 main_mtpp->kv_state(), e)) {
+                    std::fprintf(stderr, "strata serve: conversation disk: %s; not parked\n", e.c_str());
+                    return;
+                }
+                strata::core::SessionWriteOptions wo;
+                wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                wo.progress = [](uint64_t done, uint64_t) {
+                    strata::core::progress_at("parking a conversation on disk, MiB", (int64_t) (done >> 20));
+                    strata::core::progress_allow(0);
+                };
+                wo.phase = [](const char* phase, uint64_t bytes) {
+                    strata::core::progress_at(phase);
+                    strata::core::progress_allow(strata::core::session_phase_limit_s(bytes));
+                };
+                uint64_t bytes = 0;
+                strata::core::SessionStatus st;
+                if (!strata::core::session_file_write(path, meta, sources, id, bytes, e, wo, &st)) {
+                    std::fprintf(stderr, "strata serve: conversation disk: writing %s failed: %s\n", path.c_str(), e.c_str());
+                    std::error_code ec;
+                    std::filesystem::remove(path, ec);
+                    return;
+                }
+                DiskParked d;
+                d.path = path;
+                d.ids = live;
+                for (const ConvCheckpoint& c : disk_checks)
+                    if (c.imgs.empty()) d.checks.push_back(c.ids);
+                d.cvec = cvec_cached;
+                d.bytes = bytes;
+                d.used = ++disk_clock;
+                disk_parked.push_back(std::move(d));
+                disk_bytes += bytes;
+                size_t evicted = 0;
+                while (disk_bytes > disk_budget && !disk_parked.empty()) {   // the least recently used first
+                    size_t v = 0;
+                    for (size_t i = 1; i < disk_parked.size(); ++i)
+                        if (disk_parked[i].used < disk_parked[v].used) v = i;
+                    disk_remove(v);
+                    ++evicted;
+                }
+                std::fprintf(stderr, "strata serve: conversation disk: parked %zu tokens (%.0f MiB) in %.0f ms; %zu on disk, "
+                                     "%.1f GiB%s\n", live.size(), (double) bytes / 1048576.0,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), disk_parked.size(),
+                             (double) disk_bytes / 1073741824.0,
+                             evicted ? (", " + std::to_string(evicted) + " evicted").c_str() : "");
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: conversation disk: out of memory; not parked\n");
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+        };
+        struct DiskMatch { int index = -1; int64_t tokens = 0; bool live = false; };
+        auto disk_best = [&](const std::vector<int64_t>& p, bool cvec) -> DiskMatch {
+            DiskMatch m;
+            const int64_t n = (int64_t) p.size();
+            auto pre = [&](const std::vector<int32_t>& x) -> int64_t {
+                const int64_t L = (int64_t) x.size();
+                if (L < 1 || L > n - 1) return 0;
+                for (int64_t i = 0; i < L; ++i)
+                    if ((int64_t) x[(size_t) i] != p[(size_t) i]) return 0;
+                return L;
+            };
+            for (int i = 0; disk_on && i < (int) disk_parked.size(); ++i) {
+                const DiskParked& d = disk_parked[(size_t) i];
+                if (d.cvec != cvec) continue;
+                const int64_t a = pre(d.ids);
+                if (a > m.tokens) m = {i, a, true};
+                for (const auto& c : d.checks) {
+                    const int64_t b = pre(c);
+                    if (b > m.tokens) m = {i, b, false};
+                }
+            }
+            return m;
+        };
+        // the file of entry i into `incoming` (validated later as a parked image is); the entry and its file go
+        auto disk_take = [&](int i, std::optional<strata::core::SavedConversation>& incoming) -> bool {
+            DiskParked d = std::move(disk_parked[(size_t) i]);
+            disk_parked.erase(disk_parked.begin() + i);
+            disk_bytes -= std::min(disk_bytes, d.bytes);
+            const auto t0 = Clock::now();
+            std::string e;
+            bool ok = false;
+            try {
+                strata::core::SessionFileIdentity id;
+                if (session_identity(id, e, [] {})) {
+                    strata::core::SessionReadLimits limits;
+                    limits.progress = [](uint64_t done, uint64_t) {
+                        strata::core::progress_at("reading a parked conversation from disk, MiB", (int64_t) (done >> 20));
+                        strata::core::progress_allow(0);
+                    };
+                    limits.admit = disk_admit;
+                    strata::core::SavedConversation image;
+                    size_t bytes = 0;
+                    strata::core::SessionStatus st;
+                    if (strata::core::conversation_session_read_limits(limits, *main_ssp, g,
+                                                                       main_mtpp->kv_state(),
+                                                                       (uint64_t) o.max_context,
+                                                                       (uint64_t) std::max(o.prompt_cache, 1), e) &&
+                        strata::core::session_file_read(d.path, id, image, bytes, e, limits, &st)) {
+                        incoming.emplace(std::move(image));
+                        ok = true;
+                    }
+                }
+            } catch (const std::bad_alloc&) {
+                e = "out of memory";
+            }
+            std::error_code ec;
+            std::filesystem::remove(d.path, ec);
+            if (ok)
+                std::fprintf(stderr, "strata serve: conversation disk: read %zu tokens back in %.0f ms; %zu on disk\n",
+                             d.ids.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             disk_parked.size());
+            else
+                std::fprintf(stderr, "strata serve: conversation disk: could not read %zu tokens back (%s); the prompt is read\n",
+                             d.ids.size(), e.c_str());
+            return ok;
+        };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
@@ -9444,7 +9690,7 @@ int main(int argc, char** argv) {
                 if (t < 0) { e = "every session is a running slot's"; return false; }
                 main_phys = slot_phys[(size_t) t];
                 slot_phys[(size_t) t] = -1;
-                bs[(size_t) t] = BSlot{};
+                pool_slot_to_main(bs[(size_t) t]);   // its conversation, if any: parked before the read overwrites it
             }
             return pool_bind(e);
         };
@@ -10481,7 +10727,7 @@ int main(int argc, char** argv) {
                 live_ok = false;
                 checks.clear();
                 tail_ckpt_len = -1;
-                const size_t n_parked = conversations.clear();
+                const size_t n_parked = conversations.clear() + disk_clear();
                 size_t n_slots = 0, n_running = 0;
                 for (BSlot& sl : bs)
                     if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
@@ -10534,6 +10780,15 @@ int main(int argc, char** argv) {
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            int64_t incoming_tokens = parked.tokens;
+            bool incoming_live = parked.live;
+            if (!incoming && disk_on && req_imgs.empty()) {   // --conversation-disk: a parked file holds more of it
+                const auto dm = disk_best(ids, want_cvec);
+                if (dm.index >= 0 && dm.tokens > std::max(resume, slot_tokens) && disk_take(dm.index, incoming)) {
+                    incoming_tokens = dm.tokens;
+                    incoming_live = dm.live;
+                }
+            }
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -10569,6 +10824,7 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
+            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling) disk_park();   // --conversation-disk
             if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -10661,8 +10917,8 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
                 cvec_cached = incoming->cvec;
-                resume = parked.tokens;
-                from_live = parked.live;
+                resume = incoming_tokens;
+                from_live = incoming_live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
