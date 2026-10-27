@@ -16,12 +16,13 @@
   "prefill-expert-128-row-tiles",
   "prefill-expert-scale-layout",
   "decode-fusion-opt-in",
-  "hc-q8-replace-opt-in"
+  "hc-q8-replace-opt-in",
+  "slot-pool-opt-in"
  ],
- "git_commit": "f41682b48006b99133d77a03b84606dfd0c69270",
- "git_branch": "r9700-prefill-residency",
+ "git_commit": "d222876c911fb3d403ef7aa8dc688419103edc7c",
+ "git_branch": "two-session-redesign",
  "git_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
- "binary_sha256": "09cd587e4fc217cbab738b1c063d18818729fe0f2f2ed4b198a2e8231be59c34",
+ "binary_sha256": "a2a4a5041e49dd9d2bf103fe7811303eb0ed2a9d8f25df22c63d9f97cee83f63",
  "vision_binary_sha256": "7ded236af79b9e98af6575f0b58dd5115883f38bbbdda4cbc625c63759249754",
  "vision_projector_sha256": "6cbb8943b156bed0aca85a48a2d33f1c820885c5787447b0c37985f54809b0fe"
 }

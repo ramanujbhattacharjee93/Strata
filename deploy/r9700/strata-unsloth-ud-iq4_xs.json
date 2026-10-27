@@ -29,7 +29,9 @@
     "--kv-resident",
     "20480",
     "--no-kv-grow",
-    "--batch-mtp"
+    "--batch-mtp",
+    "--lookup-chain",
+    "3"
   ],
   "cwd": "/home/rambhatt/.local/opt/Strata",
   "tokenizer": "/srv/LLM/Strata-data/packs/unsloth-ud-iq4_xs/tokenizer",
@@ -57,7 +59,9 @@
     "STRATA_FZ_COMMIT": "1",
     "STRATA_FZ_PAIR": "1",
     "STRATA_FZ_ROUTE": "1",
-    "STRATA_FZ_NOPCIE": "1"
+    "STRATA_FZ_NOPCIE": "1",
+    "STRATA_HC_Q8": "2",
+    "STRATA_SLOT_POOL": "1"
   },
   "port": 8080,
   "gpu": 0,

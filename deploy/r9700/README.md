@@ -52,6 +52,28 @@ Measured on two uncached 64K prompts with MTP on: about 2.2% less time per windo
 `STRATA_FZ_NOPCIE`. Two concurrent 64K prompts: 48.62 -> 46.72 ms per window (+5.9% rows/s) from adding
 `STRATA_FZ_NOPCIE`. Prefill was unchanged (above 3,200 tok/s). Removing a switch restores the previous path.
 
+## Q8 hyper-connections, two sessions and the lookup chain, 2026-10-25/26
+
+The engine is built from `two-session-redesign` (`BUILD.json`; not merged into `r9700-prefill-residency`).
+Three more settings are on in the config:
+
+- `STRATA_HC_Q8=2`: the 48 layers' hyper-connection down/up projections are served from the GGUF's Q8_0 bytes only;
+  their BF16 rows are not loaded. The prompt path dequantizes each half's rows to the same BF16 bits (all
+  629,145,600 values checked). Solo 64K decode +4%, prefill unchanged, expert cache 9,979 -> 10,160 slots.
+- `STRATA_SLOT_POOL=1`: two batch slots on two sessions instead of three. The main session is one of them: a request
+  moves between the solo path and a slot by renaming a session, not copying it. Each session's drafter moves with
+  it (two drafters, not three). One session's VRAM and pinned K/V come back: expert cache 10,538 slots, and every
+  expert the prompt path borrows stays in RAM (no SSD reads during a 64K prompt; there were ~2.7 GB). Admission
+  ~70 ms (was 160-350 ms), back to solo ~2 ms (was ~650 ms). With the switch off the binary's output equals the
+  previous one on three prompts in three runs. Disk sessions (SAVE / RESTORE) are refused with the pool.
+- `--lookup-chain 3`: prompt-lookup drafts after the MTP's in the solo windows: +4% on edit-style output that repeats
+  the prompt, no change elsewhere.
+
+Two concurrent 64K prompts with up to 8K output each, twice: about 81 tok/s together (39.4-39.7 ms per batch window,
+3.2 rows, 62.6-62.8% of proposals accepted, 97.4-97.6% expert-cache hits); the first prompt read at 3,382-3,491 tok/s,
+the second (beside the decoding slot) at 2,811-2,830 tok/s. A third slot (`parallel: 3`, three sessions) gained 4%
+in aggregate and brought the SSD reads back, so the profile stays at two.
+
 ## Measurements and the rejected third slot
 
 Earlier warm 32K prefill measured about 3,375 tok/s (about 3,190 before the 128-row expert work items and
