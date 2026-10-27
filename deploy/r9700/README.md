@@ -74,6 +74,21 @@ Two concurrent 64K prompts with up to 8K output each, twice: about 81 tok/s toge
 the second (beside the decoding slot) at 2,811-2,830 tok/s. A third slot (`parallel: 3`, three sessions) gained 4%
 in aggregate and brought the SSD reads back, so the profile stays at two.
 
+## Conversations parked on the NVMe, 2026-10-26
+
+The engine is built from `conversation-disk` (`BUILD.json`). The config adds
+`--conversation-disk /srv/LLM/Strata-data/conv-park --conversation-disk-gib 32`: a conversation of at least 4,096
+tokens that the main session gives up (another one is read into it, or a slot's session is taken for a read) is
+written to that folder as SAVE writes it - the live state, the deepest checkpoint and the K/V streamed from the
+session pools - and only its tokens stay in RAM. A request that continues it reads the file back through the
+parked-conversation restore path instead of reading its prompt. The least recently used files go beyond 32 GiB;
+files of an earlier run are removed at the start, and non-finite logits drop them all.
+
+`/srv` (the NVMe's NTFS partition, ntfs3) is mounted read-write for this (`/etc/fstab`, set by the operator;
+Windows hibernation is off). Measured through ntfs3: 1.1 GB/s writing with fsync, 2.6 GB/s reading. A 30K-token
+conversation is a 670 MiB file: parked in 0.56-0.81 s, read back in 0.75 s, restored in 0.11 s; its next turn read
+its prompt in 2.3 s instead of ~9.5 s (1.0 s while it was still in its session).
+
 ## Measurements and the rejected third slot
 
 Earlier warm 32K prefill measured about 3,375 tok/s (about 3,190 before the 128-row expert work items and

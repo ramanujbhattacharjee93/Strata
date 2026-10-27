@@ -17,12 +17,13 @@
   "prefill-expert-scale-layout",
   "decode-fusion-opt-in",
   "hc-q8-replace-opt-in",
-  "slot-pool-opt-in"
+  "slot-pool-opt-in",
+  "conversation-disk-opt-in"
  ],
- "git_commit": "d222876c911fb3d403ef7aa8dc688419103edc7c",
- "git_branch": "two-session-redesign",
+ "git_commit": "b05a9ef9ceb7a46e0d7d45ac7fd9570ed7266c96",
+ "git_branch": "conversation-disk",
  "git_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
- "binary_sha256": "a2a4a5041e49dd9d2bf103fe7811303eb0ed2a9d8f25df22c63d9f97cee83f63",
+ "binary_sha256": "638f8b5df299cbfe26c27262079cd8a3de66a29ca9dff6547d407f246674007e",
  "vision_binary_sha256": "7ded236af79b9e98af6575f0b58dd5115883f38bbbdda4cbc625c63759249754",
  "vision_projector_sha256": "6cbb8943b156bed0aca85a48a2d33f1c820885c5787447b0c37985f54809b0fe"
 }

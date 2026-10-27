@@ -31,7 +31,11 @@
     "--no-kv-grow",
     "--batch-mtp",
     "--lookup-chain",
-    "3"
+    "3",
+    "--conversation-disk",
+    "/srv/LLM/Strata-data/conv-park",
+    "--conversation-disk-gib",
+    "32"
   ],
   "cwd": "/home/rambhatt/.local/opt/Strata",
   "tokenizer": "/srv/LLM/Strata-data/packs/unsloth-ud-iq4_xs/tokenizer",
